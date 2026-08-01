@@ -1,0 +1,9 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# 所有第三方 C 库都使用 Cargo vendored 源码。禁用 pkg-config 的默认系统
+# 搜索，避免 libusb1-sys 发现 libudev 或系统 libusb 后把动态依赖带进发行物。
+# 用户显式设置这两个变量时保留用户选择，便于本地调试系统库。
+[env]
+PKG_CONFIG_LIBDIR = { value = "/__adb_rust_no_pkg_config__", force = false }
+PKG_CONFIG_PATH = { value = "/__adb_rust_no_pkg_config__", force = false }

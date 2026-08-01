@@ -1,0 +1,47 @@
+[package]
+name = "adb-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Muka Rust ADB：可替代官方实现的 Rust 版 Android Debug Bridge 主机端"
+authors = ["Attect"]
+license = "MIT"
+homepage = "https://muka.cool/rust_adb"
+repository = "https://github.com/Attect/muka_rust_adb"
+
+[[bin]]
+name = "adb"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.10.3"
+axmldecoder = "0.5.0"
+aws-lc-sys = { version = "0.43.0", features = ["prebuilt-nasm"] }
+base64 = "0.22.1"
+brotli = "8"
+crossterm = "0.29"
+filetime = "0.2"
+hkdf = "0.12.4"
+lz4_flex = "0.11"
+libc = "0.2"
+mdns-sd = { version = "0.20.1", default-features = false }
+md-5 = "0.10.6"
+prost = "0.14.4"
+rand = "0.8"
+rcgen = { version = "0.13.2", default-features = false, features = ["aws_lc_rs", "crypto"] }
+rsa = { version = "0.9.10", features = ["pem", "sha1"] }
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "std"] }
+rusb = { version = "0.9.4", features = ["vendored"] }
+sha1 = "0.10"
+sha2 = "0.10.9"
+signature = "2"
+tempfile = "3"
+zstd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate", "zstd", "bzip2", "lzma", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinSock"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
