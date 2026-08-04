@@ -1778,15 +1778,111 @@ fn start_server_auto_launches_with_ack_and_can_be_stopped() {
     panic!("auto-started adb server did not stop listening");
 }
 
+/// 只 bind 不 listen 的 TCP 占位 socket：让 client 的 server 探测固定得到
+/// ConnectionRefused（视为 server 不存在），同时保证子 server bind 同一端口
+/// 固定失败，避免 accept/close 与探测写入之间的内核时序决定测试走哪条路径。
+#[cfg(unix)]
+struct TcpPortBlocker(#[allow(dead_code)] std::fs::File);
+
+#[cfg(windows)]
+struct TcpPortBlocker(windows_sys::Win32::Networking::WinSock::SOCKET);
+
+#[cfg(windows)]
+impl Drop for TcpPortBlocker {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Networking::WinSock::closesocket(self.0) };
+    }
+}
+
+#[cfg(unix)]
+fn block_tcp_port_without_listen() -> (TcpPortBlocker, u16) {
+    use std::os::unix::io::FromRawFd;
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: libc::htonl(libc::INADDR_LOOPBACK),
+        },
+        sin_zero: [0; 8],
+    };
+    let result = unsafe {
+        libc::bind(
+            fd,
+            (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "bind: {}", std::io::Error::last_os_error());
+    let mut resolved: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut resolved as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut length,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "getsockname: {}",
+        std::io::Error::last_os_error()
+    );
+    (TcpPortBlocker(file), u16::from_be(resolved.sin_port))
+}
+
+#[cfg(windows)]
+fn block_tcp_port_without_listen() -> (TcpPortBlocker, u16) {
+    use windows_sys::Win32::Networking::WinSock::{
+        self, AF_INET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, WSADATA, WSASocketW,
+    };
+
+    unsafe {
+        let mut wsa_data: WSADATA = std::mem::zeroed();
+        WinSock::WSAStartup(0x0202, &mut wsa_data);
+        let socket = WSASocketW(
+            i32::from(AF_INET),
+            SOCK_STREAM,
+            IPPROTO_TCP,
+            std::ptr::null(),
+            0,
+            0,
+        );
+        assert_ne!(socket, WinSock::INVALID_SOCKET, "WSASocketW failed");
+        let mut address: SOCKADDR_IN = std::mem::zeroed();
+        address.sin_family = AF_INET;
+        address.sin_addr.S_un.S_addr = u32::from_be(0x7F00_0001);
+        let result = WinSock::bind(
+            socket,
+            (&address as *const SOCKADDR_IN).cast::<SOCKADDR>(),
+            std::mem::size_of::<SOCKADDR_IN>() as i32,
+        );
+        assert_eq!(result, 0, "bind failed: {}", WinSock::WSAGetLastError());
+        let mut resolved: SOCKADDR_IN = std::mem::zeroed();
+        let mut length = std::mem::size_of::<SOCKADDR_IN>() as i32;
+        let result = WinSock::getsockname(
+            socket,
+            (&mut resolved as *mut SOCKADDR_IN).cast::<SOCKADDR>(),
+            &mut length,
+        );
+        assert_eq!(
+            result,
+            0,
+            "getsockname failed: {}",
+            WinSock::WSAGetLastError()
+        );
+        (TcpPortBlocker(socket), u16::from_be(resolved.sin_port))
+    }
+}
+
 #[test]
 fn start_server_relays_child_bind_failure_diagnostics() {
     let _permit = integration_limiter().acquire();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let accept_listener = listener.try_clone().unwrap();
-    let accept = thread::spawn(move || {
-        let _ = accept_listener.accept();
-    });
+    let (_blocker, port) = block_tcp_port_without_listen();
     let android_home = tempfile::tempdir().unwrap();
 
     let output = output_adb_with_retry(
@@ -1800,7 +1896,6 @@ fn start_server_relays_child_bind_failure_diagnostics() {
             .env("ADB_MDNS", "0"),
         "adb start-server bind failure",
     );
-    accept.join().unwrap();
 
     assert!(
         !output.status.success(),
