@@ -1,0 +1,11 @@
+# 以下文件以 include_bytes! 按字节精确嵌入产物并参与 SHA-256 校验，
+# 任何行尾转换（core.autocrlf / git archive）都会破坏校验，统一按二进制处理。
+assets/fastdeploy/* -text
+tests/data/* -text
+
+# Unix shell 脚本在 bash 下必须保持 LF；CRLF 会让 set -euo pipefail 等
+# 选项行尾混入 \r 导致语法错误，且不得随 autocrlf/archive 转换。
+scripts/*.sh -text
+
+# .gitattributes 自身也保持 LF。
+.gitattributes -text

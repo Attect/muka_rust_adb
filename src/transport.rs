@@ -2937,14 +2937,21 @@ mod tests {
                 .unwrap();
             tls.flush().unwrap();
 
-            let write = AdbMessage::read_from(&mut tls, protocol::MAX_PAYLOAD).unwrap();
-            assert_eq!(write.command, protocol::A_WRTE);
-            assert_eq!(write.payload, server_expected);
-            AdbMessage::new(protocol::A_OKAY, device_id, host_id, Vec::new())
-                .unwrap()
-                .write_to(&mut tls, protocol::A_VERSION)
-                .unwrap();
-            tls.flush().unwrap();
+            // smart-socket 一次 read 可能短读（macOS TCP 分段），一个
+            // 64 KiB 输入会拆成多个 A_WRTE；按真实 adbd 语义每收一个包
+            // 立即回 A_OKAY 补充写 credit，再按字节流累积完整输入。
+            let mut received = Vec::new();
+            while received.len() < server_expected.len() {
+                let write = AdbMessage::read_from(&mut tls, protocol::MAX_PAYLOAD).unwrap();
+                assert_eq!(write.command, protocol::A_WRTE);
+                received.extend_from_slice(&write.payload);
+                AdbMessage::new(protocol::A_OKAY, device_id, host_id, Vec::new())
+                    .unwrap()
+                    .write_to(&mut tls, protocol::A_VERSION)
+                    .unwrap();
+                tls.flush().unwrap();
+            }
+            assert_eq!(received, server_expected);
 
             let close = AdbMessage::read_from(&mut tls, protocol::MAX_PAYLOAD).unwrap();
             assert_eq!(close.command, protocol::A_CLSE);
@@ -3071,7 +3078,16 @@ mod tests {
                 .unwrap()
                 .write_to(&mut stream, protocol::A_VERSION)
                 .unwrap();
-            let ack = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            // 等待 host 对 1 MiB 输出的 A_OKAY；期间按真实 adbd 语义持续消费
+            // host 转发的输入，避免设备 TCP 发送缓冲被占满后互相阻塞。
+            let ack = loop {
+                let packet = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+                match packet.command {
+                    protocol::A_OKAY => break packet,
+                    protocol::A_WRTE => continue,
+                    other => panic!("unexpected packet {other}"),
+                }
+            };
             assert_eq!(ack.command, protocol::A_OKAY);
             AdbMessage::new(protocol::A_CLSE, device_id, host_id, Vec::new())
                 .unwrap()
@@ -3096,7 +3112,13 @@ mod tests {
                 .unwrap();
             let spam = thread::spawn(move || {
                 let input = [0_u8; 16 * 1024];
-                while writer.write_all(&input).is_ok() {}
+                // 固定总量 + 写超时兜底：对端持续消费时写满即退出，对端停止
+                // 读取时 100ms 超时失败退出；不依赖平台对半关闭 socket 写语义。
+                for _ in 0..128 {
+                    if writer.write_all(&input).is_err() {
+                        break;
+                    }
+                }
             });
 
             let mut output = Vec::new();
@@ -3160,7 +3182,12 @@ mod tests {
                 .unwrap();
             let spam = thread::spawn(move || {
                 let input = [0_u8; 16 * 1024];
-                while writer.write_all(&input).is_ok() {}
+                // 与 remote_close 测试相同的固定总量退出策略。
+                for _ in 0..128 {
+                    if writer.write_all(&input).is_err() {
+                        break;
+                    }
+                }
             });
 
             let mut output = Vec::new();

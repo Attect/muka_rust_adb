@@ -40,7 +40,8 @@ case "$format" in
         ;;
     *"Mach-O"*)
         command -v otool >/dev/null || { echo "standalone check failed: 需要 otool" >&2; exit 1; }
-        deps=$(otool -L "$artifact" | tail -n +2 | sed -E 's/^\s+([^ ]+).*/\1/')
+        # BSD sed 不支持 GNU 的 \s，用 POSIX 字符类提取依赖路径。
+        deps=$(otool -L "$artifact" | tail -n +2 | sed -E 's/^[[:space:]]+([^ ]+).*/\1/')
         while IFS= read -r dep; do
             [[ -z "$dep" ]] && continue
             case "$dep" in

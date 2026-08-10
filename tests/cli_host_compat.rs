@@ -1801,13 +1801,12 @@ fn block_tcp_port_without_listen() -> (TcpPortBlocker, u16) {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0,
-        sin_addr: libc::in_addr {
-            s_addr: libc::htonl(libc::INADDR_LOOPBACK),
-        },
-        sin_zero: [0; 8],
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    // zeroed 覆盖 Linux 的 sin_zero 与 macOS/BSD 的 sin_len，逐字段赋值保持跨平台。
+    address.sin_family = libc::AF_INET as libc::sa_family_t;
+    address.sin_port = 0;
+    address.sin_addr = libc::in_addr {
+        s_addr: libc::htonl(libc::INADDR_LOOPBACK),
     };
     let result = unsafe {
         libc::bind(

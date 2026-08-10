@@ -545,7 +545,8 @@ impl IncrementalConnection for InheritedSocket {
         let max_timeout_seconds = libc::time_t::MAX;
         let value = libc::timeval {
             tv_sec: timeout.as_secs().try_into().unwrap_or(max_timeout_seconds),
-            tv_usec: timeout.subsec_micros().into(),
+            // Linux 的 suseconds_t 是 i64，macOS/BSD 是 i32，统一按目标平台类型转换。
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
         };
         let result = unsafe {
             libc::setsockopt(
