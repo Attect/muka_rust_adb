@@ -45,3 +45,16 @@ Windows server 按 AOSP 创建不可见的顶层窗口和独立消息泵，监�
 真实 S3 在 2026-07-20 完成三设备验证。第一次恢复暴露 API 28 `8b876adb` 首次枚举缺失后 serial descriptor 暂时不可读，导致错误退化为 `usb:001:019:2717:ff18:1`；改为 30 秒 `devpath -> serial` 恢复窗口后再次进入 S3，Windows 事件 `465721/465732` 分别确认进入与恢复，三台 transport id 从 `3/2/5` 重建为 `9/10/11`，serial 与 devpath 全部保持，三个 `get-state` 均返回 `device`，API 28 shell 也成功，fallback serial 未再次出现。AOSP `PowerTest.test_resume_usb_kick` 仍作为模拟恢复广播的补充门禁，不能替代该真实 S3 证据。AOSP `SocketTest.test_socket_flush` 已在 API 34/36 通过，证明远端 `A_CLSE` 时即使 smart-socket 仍有未读输入，也会先有序发送完整输出并排空输入，不在 Windows 上产生 TCP RST。SDK 中 `AdbWinApi.dll` 与 `AdbWinUsbApi.dll` 保持 `.disabled` 后缀时上述回归仍通过。
 
 这些证据仍只覆盖当前机器的驱动组合和一次基线 S3 恢复。不同 Android 厂商驱动、真实 `NOPERMISSION`、多个 interface、反复睡眠循环、长时间睡眠及活动传输中睡眠仍需分别回归；单文件发布也不会自动修复 libusb 无权访问的设备驱动。
+
+## 与官方 37.x USB 后端（libadbusb）的对比结论
+
+官方 platform-tools 37.0.1（2026-07 Canary）在 Windows 上引入自研 `libadbusb` 取代 libusb 并设为默认，`ADB_USB_LEGACY=1` 回退旧后端；同版本 macOS 默认停用 libusb 改用原生 IOKit 后端（`ADB_LIBUSB=1` 可启用），Linux libusb 后端的热插拔改用 udev netlink 事件。官方 `adb server-status` 因此自报 `usb_backend: LIBADBUSB`（wire 值 4，2026-09-11 用 37.0.1 官方二进制在隔离端口实测；`mdns_backend: LIBADBMDNS` 同为实测值 3）。
+
+截至 2026-09-11，`libadbusb` 未随 AOSP 开源：main 分支全仓库无 `adbusb` 命中，`Android.bp` 仍编译 `usb_libusb*.cpp`（Windows 同时保留 legacy `usb_windows.cpp`/AdbWinApi 源码），公开代码也没有 `ADB_USB_LEGACY` 环境变量，判断为 Google 内部后端。本仓库结论是**继续使用 rusb 的 vendored libusb，不更换**：
+
+1. libadbusb 不可引入——未开源、无稳定 ABI，也没有可复用的 Rust binding。
+2. USB 后端位于 wire 协议之下，官方换后端对设备侧和 smart-socket 语义零影响，不存在兼容性压力。
+3. 本仓库的单文件静态发行（见上文导入表约束）与三真机回归、S3 恢复、热插拔、无权限占位等全部真实证据都构建在 vendored libusb 上，更换即全部作废且无用户可见收益。
+4. libadbusb 解决的是 Google 规模下的 Windows 驱动矩阵与热插拔竞态问题；本仓库当前证据没有对应失败案例。
+
+对齐动作：`server-status` 解码已支持官方 `LIBADBUSB`(4)/`LIBADBMDNS`(3) 枚举，本 server 自报 `LIBUSB`(2)/`LIBADBMDNS`(3)，官方客户端可正常解码；libusb bulk-in 短 timeout 轮询 close 标志的做法与官方 36.x"同步 API 重写"方向一致。若后续 libadbusb 开源进 AOSP main、本仓库驱动矩阵出现 libusb 无法修复的真实故障、或官方改变 `LIBUSB`(2) 的语义，再重新评估。

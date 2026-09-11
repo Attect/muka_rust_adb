@@ -169,7 +169,10 @@ pub fn discovery_enabled() -> bool {
 
 pub fn check_message(enabled: bool) -> &'static str {
     if enabled {
-        "mdns daemon version [Openscreen discovery 0.0.0]"
+        // 官方 platform-tools 37.0.1 的 libadbmdns 后端 `adb mdns check` 自报
+        // "adb discovery 0.0.0"；公开 AOSP main 上旧的 openscreen 后端才是
+        // "Openscreen discovery 0.0.0"。这里按官方 37.x 二进制对齐，勿"改回"。
+        "mdns daemon version [adb discovery 0.0.0]"
     } else {
         "ERROR: mdns discovery disabled"
     }
@@ -512,7 +515,7 @@ mod tests {
         assert_eq!(check_message(false), "ERROR: mdns discovery disabled");
         assert_eq!(
             check_message(true),
-            "mdns daemon version [Openscreen discovery 0.0.0]"
+            "mdns daemon version [adb discovery 0.0.0]"
         );
     }
 

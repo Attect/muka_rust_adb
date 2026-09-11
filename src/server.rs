@@ -5828,7 +5828,7 @@ mod tests {
         );
         assert_eq!(
             status.mdns_backend,
-            crate::server_status::MdnsBackend::Openscreen
+            crate::server_status::MdnsBackend::Libadbmdns
         );
     }
 

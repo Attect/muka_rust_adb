@@ -8,6 +8,9 @@ pub enum UsbBackend {
     Unknown,
     Native,
     Libusb,
+    // 官方 platform-tools 37.x 的 libadbusb 后端在 wire 上自报 4（跳过了 3），
+    // 由 37.0.1 官方二进制 server-status 实测得出。
+    Libadbusb = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +50,8 @@ impl AdbServerStatus {
             // 当前发行版只使用 rusb 的 vendored libusb，旧的 NATIVE 枚举值仅保留解码兼容。
             usb_backend: UsbBackend::Libusb,
             usb_backend_forced: Some(false),
-            mdns_backend: MdnsBackend::Openscreen,
+            // mdns check 文案已与官方 37.x libadbmdns 对齐，server-status 同步自报 LIBADBMDNS。
+            mdns_backend: MdnsBackend::Libadbmdns,
             mdns_backend_forced: Some(std::env::var_os("ADB_MDNS_OPENSCREEN").is_some()),
             version: format!("adb-rust-{}", env!("CARGO_PKG_VERSION")),
             build: "adb-rust".to_string(),
@@ -226,6 +230,7 @@ impl UsbBackend {
         match value {
             1 => Self::Native,
             2 => Self::Libusb,
+            4 => Self::Libadbusb,
             _ => Self::Unknown,
         }
     }
@@ -235,6 +240,7 @@ impl UsbBackend {
             Self::Unknown => "UNKNOWN_USB",
             Self::Native => "NATIVE",
             Self::Libusb => "LIBUSB",
+            Self::Libadbusb => "LIBADBUSB",
         }
     }
 }
@@ -496,6 +502,15 @@ mod tests {
         let status = AdbServerStatus::decode(&bytes).unwrap();
         assert_eq!(status.mdns_backend, MdnsBackend::Libadbmdns);
         assert!(status.to_text_proto().contains("mdns_backend: LIBADBMDNS"));
+    }
+
+    #[test]
+    fn server_status_decodes_libadbusb_enum() {
+        let mut bytes = Vec::new();
+        write_varint_field(&mut bytes, 1, 4);
+        let status = AdbServerStatus::decode(&bytes).unwrap();
+        assert_eq!(status.usb_backend, UsbBackend::Libadbusb);
+        assert!(status.to_text_proto().contains("usb_backend: LIBADBUSB"));
     }
 
     #[test]
