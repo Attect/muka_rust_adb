@@ -31,6 +31,18 @@ const TCP_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const TCP_RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(3);
 const TCP_RECONNECT_MAX_ATTEMPTS: usize = 20;
 const USB_RESUME_SERIAL_TTL: Duration = Duration::from_secs(30);
+/// 对齐 AOSP `transport_emulator.cpp` 的 `LOCAL_PORT_RETRY_COUNT`：
+/// 曾注册成功的模拟器端口断线后最多重试 60 次，用尽后放弃。
+const EMULATOR_PORT_RETRY_COUNT: u32 = 60;
+
+/// 模拟器端口连接探测结果：区分“无监听者”与“有监听者但握手失败”，
+/// 后者才会收进断线重试 registry，避免对空端口做无意义重试。
+#[derive(Debug, PartialEq, Eq)]
+enum EmulatorConnectOutcome {
+    Registered,
+    HandshakeFailed,
+    Unreachable,
+}
 
 struct MdnsAutoConnectEntry {
     serial: Option<String>,
@@ -74,6 +86,9 @@ struct ServerState {
     mdns: Mutex<Option<mdns::DiscoveryState>>,
     mdns_auto_connects: Mutex<HashMap<String, MdnsAutoConnectEntry>>,
     tcp_reconnects: Mutex<HashMap<String, TcpReconnectEntry>>,
+    // 对齐 AOSP `transport_emulator.cpp` 的 retry_ports：adb 端口 -> 剩余重试次数。
+    // 只收录曾注册成功后断开的模拟器端口；成功恢复或次数用尽后移除。
+    emu_retry_ports: Mutex<HashMap<u16, u32>>,
     usb_resume_generation: AtomicU64,
     // Windows 恢复后的首次枚举可能暂时读不到 serial descriptor；按稳定 devpath 保留睡眠前身份。
     // transport 重新注册或短暂恢复窗口结束后立即清理，避免掩盖真实的设备更换。
@@ -104,6 +119,7 @@ impl ServerState {
             mdns: Mutex::new(mdns),
             mdns_auto_connects: Mutex::new(HashMap::new()),
             tcp_reconnects: Mutex::new(HashMap::new()),
+            emu_retry_ports: Mutex::new(HashMap::new()),
             usb_resume_generation: AtomicU64::new(usb::resume_generation()),
             usb_resume_serials: Mutex::new(HashMap::new()),
             usb_scan_errors: Mutex::new(Vec::new()),
@@ -577,57 +593,143 @@ impl ServerState {
 
     /// 按 AOSP `host:emulator:<adb_port>` 语义，显式通知 server 某个模拟器实例已启动。
     /// 连接 127.0.0.1:<adb_port>，并以 `emulator-<console_port>`（console_port = adb_port - 1）注册。
-    fn connect_emulator(&self, adb_port: u16) {
+    /// 返回端口当前是否已有可用的模拟器 transport（已注册或本次注册成功）。
+    /// 自注册时遇到 accept 但握手失败（guest adbd 尚未就绪），收进重试 registry 等待就绪。
+    fn connect_emulator(&self, adb_port: u16) -> bool {
+        match self.connect_emulator_outcome(adb_port, transport::TCP_HANDSHAKE_TIMEOUT) {
+            EmulatorConnectOutcome::Registered => true,
+            EmulatorConnectOutcome::HandshakeFailed => {
+                self.enqueue_emulator_retry_port(adb_port);
+                false
+            }
+            EmulatorConnectOutcome::Unreachable => false,
+        }
+    }
+
+    fn connect_emulator_outcome(
+        &self,
+        adb_port: u16,
+        handshake_timeout: Duration,
+    ) -> EmulatorConnectOutcome {
         self.remove_closed_transports();
         if self.has_emulator_transport_for_port(adb_port) {
-            return;
+            return EmulatorConnectOutcome::Registered;
         }
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), adb_port));
         let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
-            return;
+            return EmulatorConnectOutcome::Unreachable;
         };
         let id = self.next_transport_id.fetch_add(1, Ordering::SeqCst);
         let serial = emulator_serial_for_adb_port(adb_port);
         if !self.owns_transport_serial(&serial) {
-            return;
+            return EmulatorConnectOutcome::Unreachable;
         }
-        if let Ok(pending) = transport::prepare_tcp_stream_with_serial(id, serial, stream) {
-            let _ = self.complete_pending_transport(pending);
+        match transport::prepare_tcp_stream_with_serial_timeout(
+            id,
+            serial,
+            stream,
+            handshake_timeout,
+        )
+        .and_then(|pending| self.complete_pending_transport(pending))
+        {
+            Ok(_) => EmulatorConnectOutcome::Registered,
+            Err(err) => {
+                // AOSP 对模拟器扫描失败只输出 VLOG(TRANSPORT)：本机 5555..5585
+                // 可能被非 adbd 的监听者占用（代理、防火墙、端口转发等），
+                // 无条件打 stderr 会随扫描循环刷屏，这里只在 ADB_TRACE 开启时输出。
+                if transport::trace_enabled("transport") {
+                    eprintln!("adb-rust emulator scan failed on port {adb_port}: {err}");
+                }
+                EmulatorConnectOutcome::HandshakeFailed
+            }
         }
     }
 
+    /// AOSP 仅在 server 启动时做一次全量模拟器端口扫描（`transport_emulator.cpp`
+    /// 的 `PollAllLocalPortsForEmulator`）；此后的发现依赖模拟器 `host:emulator:`
+    /// 自注册和断线端口的有限次重试（`process_emulator_retries`），不再周期全量重扫。
+    /// 扫描使用短握手超时，避免假模拟器端口长时间拖住启动流程；端口有监听者但
+    /// 握手失败时收进重试 registry，覆盖 adbd 稍后才就绪的冷启动模拟器。
     fn scan_emulators_once(&self) -> usize {
-        if std::env::var("ADB_EMU").ok().as_deref() == Some("0") {
+        if emulator_scan_disabled() {
             return 0;
         }
 
-        let mut added = 0;
-        for adb_port in emulator_scan_ports() {
-            if self.has_emulator_transport_for_port(adb_port) {
+        emulator_scan_ports()
+            .into_iter()
+            .filter(|adb_port| {
+                match self
+                    .connect_emulator_outcome(*adb_port, transport::EMULATOR_SCAN_HANDSHAKE_TIMEOUT)
+                {
+                    EmulatorConnectOutcome::Registered => true,
+                    EmulatorConnectOutcome::HandshakeFailed => {
+                        self.enqueue_emulator_retry_port(*adb_port);
+                        false
+                    }
+                    EmulatorConnectOutcome::Unreachable => false,
+                }
+            })
+            .count()
+    }
+
+    /// 对齐 AOSP `retry_ports` 语义：只重试曾注册成功、后来断开，或扫描/自注册时
+    /// 已确认存在监听者的模拟器端口。每轮间隔由 poll 线程的 1 秒扫描 tick 驱动
+    /// （对应 `LOCAL_PORT_RETRY_INTERVAL`），成功或次数用尽（`LOCAL_PORT_RETRY_COUNT`）
+    /// 后移除；重试轮次只消耗预算、不会重新入队，保证失败端口最终会停止重试。
+    fn process_emulator_retries(&self) {
+        if emulator_scan_disabled() {
+            return;
+        }
+        self.process_emulator_retries_with(|adb_port| {
+            matches!(
+                self.connect_emulator_outcome(adb_port, transport::EMULATOR_SCAN_HANDSHAKE_TIMEOUT),
+                EmulatorConnectOutcome::Registered
+            )
+        });
+    }
+
+    fn process_emulator_retries_with<F>(&self, mut probe: F)
+    where
+        F: FnMut(u16) -> bool,
+    {
+        let ports: Vec<u16> = self
+            .emu_retry_ports
+            .lock()
+            .expect("emulator retry registry poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for adb_port in ports {
+            // transport 已恢复（例如模拟器经 `host:emulator:` 自注册）时直接清账，不再探测。
+            if self.has_emulator_transport_for_port(adb_port) || probe(adb_port) {
+                self.emu_retry_ports
+                    .lock()
+                    .expect("emulator retry registry poisoned")
+                    .remove(&adb_port);
                 continue;
             }
-
-            // 模拟器扫描使用短超时，避免黑端口长时间阻塞 server。
-            let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), adb_port));
-            if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-                let id = self.next_transport_id.fetch_add(1, Ordering::SeqCst);
-                let serial = emulator_serial_for_adb_port(adb_port);
-                if !self.owns_transport_serial(&serial) {
-                    continue;
-                }
-                match transport::prepare_tcp_stream_with_serial(id, serial, stream)
-                    .and_then(|pending| self.complete_pending_transport(pending))
-                {
-                    Ok(_) => {
-                        added += 1;
-                    }
-                    Err(err) => {
-                        eprintln!("adb-rust emulator scan failed on port {adb_port}: {err}");
-                    }
+            let mut retries = self
+                .emu_retry_ports
+                .lock()
+                .expect("emulator retry registry poisoned");
+            if let Some(left) = retries.get_mut(&adb_port) {
+                let left = left.saturating_sub(1);
+                if left == 0 {
+                    retries.remove(&adb_port);
+                } else {
+                    retries.insert(adb_port, left);
                 }
             }
         }
-        added
+    }
+
+    /// 对齐 AOSP `EmulatorConnection` 析构入队 retry_ports 的语义：模拟器 transport
+    /// 关闭后按固定次数恢复重试；显式 `disconnect` 直接移除、不经过此路径。
+    fn enqueue_emulator_retry_port(&self, adb_port: u16) {
+        self.emu_retry_ports
+            .lock()
+            .expect("emulator retry registry poisoned")
+            .insert(adb_port, EMULATOR_PORT_RETRY_COUNT);
     }
 
     fn scan_usb_once(&self) -> usize {
@@ -1301,10 +1403,14 @@ impl ServerState {
         let mut transports = self.transports.lock().expect("transport registry poisoned");
         let mut removed_serials = Vec::new();
         let mut offline_transports = Vec::new();
+        let mut closed_emulator_ports = Vec::new();
         transports.retain(|transport| {
             if transport.is_closed() {
                 let mut info = transport.info();
                 removed_serials.push(info.serial.clone());
+                if let Some(adb_port) = adb_port_from_emulator_serial(&info.serial) {
+                    closed_emulator_ports.push(adb_port);
+                }
                 if let Some(entry) = reconnects.get_mut(&info.serial) {
                     info.state = ConnectionState::Offline;
                     entry.info = info.clone();
@@ -1322,6 +1428,9 @@ impl ServerState {
         let removed = removed_serials.len();
         drop(transports);
         drop(reconnects);
+        for adb_port in closed_emulator_ports {
+            self.enqueue_emulator_retry_port(adb_port);
+        }
         if removed > 0 {
             self.reschedule_mdns_connections_for_serials(&removed_serials);
             self.remove_forwards_for_serials(&removed_serials);
@@ -2632,7 +2741,11 @@ fn spawn_transport_poll_thread(state: Arc<ServerState>, shutdown: Arc<AtomicBool
             scan_tick = scan_tick.wrapping_add(1);
             if scan_tick == 10 {
                 scan_tick = 0;
-                let _ = state.scan_emulators_once();
+                // AOSP 只在启动时全量扫描模拟器端口；poll 周期内仅重试断线的
+                // 已知模拟器端口（1 秒一轮，对应 LOCAL_PORT_RETRY_INTERVAL），
+                // 不再对 5555..5585 做周期全量重扫，避免假模拟器端口反复触发
+                // 握手失败刷屏并长时间阻塞本线程。
+                state.process_emulator_retries();
                 let _ = state.scan_usb_once();
             }
         }
@@ -3466,6 +3579,23 @@ fn emulator_max_port_from_env_value(value: Option<&str>) -> u16 {
 
 fn emulator_serial_for_adb_port(adb_port: u16) -> String {
     format!("emulator-{}", adb_port.saturating_sub(1))
+}
+
+/// 由 `emulator-<console_port>` serial 反解 adb 端口（console_port + 1），
+/// 用于把断线的模拟器端口收进重试 registry；非模拟器 serial 返回 None。
+fn adb_port_from_emulator_serial(serial: &str) -> Option<u16> {
+    let console_port = serial.strip_prefix("emulator-")?.parse::<u16>().ok()?;
+    console_port.checked_add(1)
+}
+
+/// `ADB_EMU=0` 语义与 AOSP `transport_emulator.cpp`/`client/main.cpp` 一致：
+/// 关闭模拟器扫描与断线重试，但不影响 `host:emulator:` 显式自注册。
+fn emulator_scan_disabled() -> bool {
+    adb_emu_disabled_from_value(std::env::var("ADB_EMU").ok().as_deref())
+}
+
+fn adb_emu_disabled_from_value(value: Option<&str>) -> bool {
+    value == Some("0")
 }
 
 fn parse_transport_id(value: &str) -> Result<u64> {
@@ -5583,6 +5713,24 @@ mod tests {
         state.transports.lock().unwrap().push(Transport::fake(info));
     }
 
+    fn fake_socket_transport(id: u64, serial: &str) -> Transport {
+        Transport::fake(TransportInfo {
+            id,
+            serial: serial.to_string(),
+            devpath: None,
+            connection_type: transport::TransportConnectionType::Socket,
+            negotiated_speed_mbps: 0,
+            max_speed_mbps: 0,
+            state: ConnectionState::Device,
+            product: None,
+            model: None,
+            device: None,
+            features: None,
+            max_payload: protocol::MAX_PAYLOAD,
+            protocol_version: protocol::A_VERSION,
+        })
+    }
+
     fn fake_detachable_usb_info(id: u64, serial: &str, state: ConnectionState) -> TransportInfo {
         TransportInfo {
             id,
@@ -5859,6 +6007,129 @@ mod tests {
     fn emulator_serial_uses_adjacent_console_port() {
         assert_eq!(emulator_serial_for_adb_port(5555), "emulator-5554");
         assert_eq!(emulator_serial_for_adb_port(5557), "emulator-5556");
+    }
+
+    #[test]
+    fn adb_port_from_emulator_serial_recovers_adb_port() {
+        assert_eq!(adb_port_from_emulator_serial("emulator-5554"), Some(5555));
+        assert_eq!(adb_port_from_emulator_serial("emulator-0"), Some(1));
+        assert_eq!(adb_port_from_emulator_serial("emulator-65535"), None);
+        assert_eq!(adb_port_from_emulator_serial("emulator-abc"), None);
+        assert_eq!(adb_port_from_emulator_serial("emulator-"), None);
+        assert_eq!(adb_port_from_emulator_serial("127.0.0.1:5555"), None);
+    }
+
+    #[test]
+    fn adb_emu_disabled_matches_official_zero_value() {
+        assert!(adb_emu_disabled_from_value(Some("0")));
+        assert!(!adb_emu_disabled_from_value(Some("1")));
+        assert!(!adb_emu_disabled_from_value(Some("")));
+        assert!(!adb_emu_disabled_from_value(None));
+    }
+
+    #[test]
+    fn closed_emulator_transport_enqueues_retry_port() {
+        let state = test_state();
+        let transport = fake_socket_transport(1, "emulator-5554");
+        state.transports.lock().unwrap().push(transport.clone());
+        transport.close();
+
+        state.remove_closed_transports();
+
+        assert_eq!(
+            state.emu_retry_ports.lock().unwrap().get(&5555),
+            Some(&EMULATOR_PORT_RETRY_COUNT)
+        );
+    }
+
+    #[test]
+    fn closed_non_emulator_transport_does_not_enqueue_retry() {
+        let state = test_state();
+        let transport = fake_socket_transport(1, "127.0.0.1:5555");
+        state.transports.lock().unwrap().push(transport.clone());
+        transport.close();
+
+        state.remove_closed_transports();
+
+        assert!(state.emu_retry_ports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_emulator_retries_decrements_until_budget_exhausted() {
+        let state = test_state();
+        state.emu_retry_ports.lock().unwrap().insert(5555, 2);
+        let probed = Mutex::new(Vec::new());
+        state.process_emulator_retries_with(|adb_port| {
+            probed.lock().unwrap().push(adb_port);
+            false
+        });
+        assert_eq!(*probed.lock().unwrap(), vec![5555]);
+        assert_eq!(state.emu_retry_ports.lock().unwrap().get(&5555), Some(&1));
+
+        state.process_emulator_retries_with(|_| false);
+
+        assert!(state.emu_retry_ports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_emulator_retries_removes_on_successful_probe() {
+        let state = test_state();
+        state
+            .emu_retry_ports
+            .lock()
+            .unwrap()
+            .insert(5557, EMULATOR_PORT_RETRY_COUNT);
+
+        state.process_emulator_retries_with(|adb_port| adb_port == 5557);
+
+        assert!(state.emu_retry_ports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_emulator_retries_skips_probe_when_transport_registered() {
+        let state = test_state();
+        add_fake_transport(&state, 1, "emulator-5554");
+        state
+            .emu_retry_ports
+            .lock()
+            .unwrap()
+            .insert(5555, EMULATOR_PORT_RETRY_COUNT);
+
+        state.process_emulator_retries_with(|_| panic!("已注册端口不应再发起探测"));
+
+        assert!(state.emu_retry_ports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handshake_outcome_only_seeds_retry_for_live_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // accept 后保持静默：模拟 guest adbd 未就绪的冷启动模拟器或假模拟器监听者。
+        let holder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let state = test_state();
+        assert_eq!(
+            state.connect_emulator_outcome(addr.port(), transport::EMULATOR_SCAN_HANDSHAKE_TIMEOUT),
+            EmulatorConnectOutcome::HandshakeFailed
+        );
+        holder.join().unwrap();
+
+        // 释放后再取一个无人监听的端口：空端口不可入重试 registry。
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = free.local_addr().unwrap().port();
+        drop(free);
+        assert_eq!(
+            state.connect_emulator_outcome(free_port, transport::EMULATOR_SCAN_HANDSHAKE_TIMEOUT),
+            EmulatorConnectOutcome::Unreachable
+        );
     }
 
     #[test]

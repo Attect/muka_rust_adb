@@ -39,6 +39,12 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 
 const FEATURE_DELAYED_ACK: &str = "delayed_ack";
 const INITIAL_DELAYED_ACK_BYTES: u32 = 32 * 1024 * 1024;
+/// TCP transport CNXN/AUTH 初始握手默认超时；握手完成后 `connect_with_auth` 会把
+/// read timeout 清回阻塞读，超时只允许作用于初始握手阶段。
+pub(crate) const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 模拟器扫描/断线重试探测使用更短的握手超时：本机端口可能被非 adbd 的监听者
+/// accept（代理、防火墙、端口转发等），按默认超时等待会长时间拖住 server poll 线程。
+pub(crate) const EMULATOR_SCAN_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 const ADB_TRACE_TAGS: &[&str] = &[
     "adb",
     "sockets",
@@ -1401,15 +1407,29 @@ pub fn connect_tcp(id: u64, target: &str) -> Result<Transport> {
 pub(crate) fn connect_tcp_with_burst_for_test(id: u64, target: &str) -> Result<Transport> {
     let serial = normalize_tcp_serial(target)?;
     let stream = TcpStream::connect(&serial)?;
-    prepare_tcp_stream_with_serial_and_auth(id, serial, stream, AuthKey::load_all()?, true)?
-        .finish(|_| {})
+    prepare_tcp_stream_with_serial_and_auth(
+        id,
+        serial,
+        stream,
+        AuthKey::load_all()?,
+        true,
+        TCP_HANDSHAKE_TIMEOUT,
+    )?
+    .finish(|_| {})
 }
 
 fn connect_tcp_with_auth(id: u64, target: &str, auth_keys: Vec<AuthKey>) -> Result<Transport> {
     let serial = normalize_tcp_serial(target)?;
     let stream = TcpStream::connect(&serial)?;
-    prepare_tcp_stream_with_serial_and_auth(id, serial, stream, auth_keys, burst_mode_enabled())?
-        .finish(|_| {})
+    prepare_tcp_stream_with_serial_and_auth(
+        id,
+        serial,
+        stream,
+        auth_keys,
+        burst_mode_enabled(),
+        TCP_HANDSHAKE_TIMEOUT,
+    )?
+    .finish(|_| {})
 }
 
 pub(crate) fn prepare_tcp_stream_with_serial(
@@ -1417,12 +1437,26 @@ pub(crate) fn prepare_tcp_stream_with_serial(
     serial: String,
     stream: TcpStream,
 ) -> Result<PendingTransport> {
+    prepare_tcp_stream_with_serial_timeout(id, serial, stream, TCP_HANDSHAKE_TIMEOUT)
+}
+
+/// 按调用方指定的超时准备 TCP transport。超时只作用于 CNXN/AUTH 初始握手：
+/// 模拟器扫描/断线重试探测传 `EMULATOR_SCAN_HANDSHAKE_TIMEOUT`，避免本机上
+/// 被 非 adbd 监听者 accept 的端口长时间拖住 server poll 线程；握手完成后
+/// `connect_with_auth` 会把 read timeout 清回阻塞读。
+pub(crate) fn prepare_tcp_stream_with_serial_timeout(
+    id: u64,
+    serial: String,
+    stream: TcpStream,
+    handshake_timeout: Duration,
+) -> Result<PendingTransport> {
     prepare_tcp_stream_with_serial_and_auth(
         id,
         serial,
         stream,
         AuthKey::load_all()?,
         burst_mode_enabled(),
+        handshake_timeout,
     )
 }
 
@@ -1432,10 +1466,11 @@ fn prepare_tcp_stream_with_serial_and_auth(
     stream: TcpStream,
     auth_keys: Vec<AuthKey>,
     burst_mode: bool,
+    handshake_timeout: Duration,
 ) -> Result<PendingTransport> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(handshake_timeout))?;
+    stream.set_write_timeout(Some(handshake_timeout))?;
     let connection: Box<dyn AdbConnection> = Box::new(TcpAdbConnection::new(stream));
 
     PendingTransport::new(
@@ -1964,6 +1999,46 @@ mod tests {
     use crate::test_adbd::StubAdbd;
 
     use super::*;
+
+    #[test]
+    fn emulator_scan_handshake_is_bounded_by_short_probe_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 持续读但从不回复、也从不主动关闭：模拟 accept 后保持静默的
+        // 代理/防火墙/端口转发等假模拟器监听者（立即关闭会因未读数据发 RST，
+        // 那样测到的就是 RST 而不是握手超时）。
+        let holder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let started = std::time::Instant::now();
+        let pending = prepare_tcp_stream_with_serial_timeout(
+            7,
+            format!("127.0.0.1:{}", addr.port()),
+            stream,
+            EMULATOR_SCAN_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap();
+        // 对端 accept 后不响应：握手应在短探测超时内失败，而不是等满默认 10s。
+        assert!(pending.finish(|_| {}).is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "扫描探测应等待短握手超时而不是立即失败，实际耗时 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "扫描探测握手应受 500ms 短超时约束，实际耗时 {elapsed:?}"
+        );
+        holder.join().unwrap();
+    }
 
     fn fake_usb_interface_for_serial(serial_number: Option<&str>) -> usb::UsbAdbInterface {
         usb::UsbAdbInterface {
@@ -2713,6 +2788,7 @@ mod tests {
             stream,
             vec![auth_key],
             false,
+            TCP_HANDSHAKE_TIMEOUT,
         )
         .unwrap();
         let placeholder = pending.transport();
