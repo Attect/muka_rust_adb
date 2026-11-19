@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +12,20 @@ use crate::error::{AdbError, Result};
 use crate::pairing::AdbTlsConnection;
 use crate::protocol::{self, AdbMessage};
 use crate::usb::{self, UsbConnection};
+
+/// 设备端状态变化回调（对齐AOSP transport的update_transport_status函数指针）：
+/// transport读循环收到设备端重发的CNXN等状态帧时触发，server层启动时注册，
+/// 用于向track-devices订阅者推送最新快照（事件驱动、非轮询）。
+static STATE_LISTENER: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// 注册全局设备端状态变化回调。应在server启动（ServerState创建后）调用一次。
+pub fn set_global_state_listener(listener: Arc<dyn Fn() + Send + Sync>) {
+    let _ = STATE_LISTENER.set(listener);
+}
+
+fn state_listener_snapshot() -> Option<Arc<dyn Fn() + Send + Sync>> {
+    STATE_LISTENER.get().cloned()
+}
 
 pub const SUPPORTED_FEATURES: &[&str] = &[
     "shell_v2",
@@ -336,6 +350,8 @@ struct TransportInner {
     reverse_forwards: Mutex<HashMap<String, String>>,
     next_local_id: AtomicU32,
     closed: AtomicBool,
+    /// 设备端状态变化回调（由server层注册，用于触发track-devices推送）
+    state_listener: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub(crate) trait AdbConnection: Send + 'static {
@@ -508,6 +524,17 @@ impl Transport {
             .lock()
             .expect("transport info poisoned")
             .state = state;
+    }
+
+    /// 注册设备端状态变化回调：transport读循环在收到对端CNXN等状态帧时触发，
+    /// server层借此向track-devices订阅者推送最新快照（对齐AOSP的
+    /// update_transport_status回调语义，事件驱动、非轮询）。
+    pub(crate) fn set_state_listener(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .state_listener
+            .lock()
+            .expect("transport state listener poisoned") = Some(listener);
     }
 
     fn activate(
@@ -712,6 +739,7 @@ impl Transport {
                 reverse_forwards: Mutex::new(HashMap::new()),
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
+                state_listener: Mutex::new(state_listener_snapshot()),
             }),
         }
     }
@@ -739,6 +767,7 @@ impl Transport {
                 reverse_forwards: Mutex::new(HashMap::new()),
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
+                state_listener: Mutex::new(state_listener_snapshot()),
             }),
         }
     }
@@ -755,6 +784,7 @@ impl Transport {
                 reverse_forwards: Mutex::new(HashMap::new()),
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
+                state_listener: Mutex::new(state_listener_snapshot()),
             }),
         }
     }
@@ -832,12 +862,45 @@ impl TransportInner {
 
     fn dispatch_packet(self: &Arc<Self>, packet: AdbMessage) -> Result<()> {
         match packet.command {
+            protocol::A_CNXN => self.handle_peer_cnxn(packet),
             protocol::A_OPEN => self.dispatch_open(packet),
             protocol::A_OKAY => self.dispatch_okay(packet),
             protocol::A_WRTE => self.dispatch_write(packet),
             protocol::A_CLSE => self.dispatch_close(packet),
             _ => Ok(()),
         }
+    }
+
+    /// 处理运行态收到的对端CNXN。
+    ///
+    /// AOSP adbd在用户完成USB调试授权（弹窗允许）后会向当前USB连接重发
+    /// CNXN（banner携带新的连接状态，通常为device）。transport读循环必须
+    /// 处理该帧并更新状态，否则状态将永久停留在unauthorized，
+    /// 表现为「点击授权后依然显示等待授权」（2026-11-19现网缺陷）。
+    fn handle_peer_cnxn(self: &Arc<Self>, packet: AdbMessage) -> Result<()> {
+        let banner = String::from_utf8_lossy(&packet.payload);
+        let parsed = parse_banner(&banner);
+        let max_payload = usize::min(packet.arg1 as usize, protocol::MAX_PAYLOAD);
+        let protocol_version = packet.arg0.min(protocol::A_VERSION);
+        {
+            let mut info = self.info.lock().expect("transport info poisoned");
+            info.state = parsed.state;
+            info.product = parsed.product;
+            info.model = parsed.model;
+            info.device = parsed.device;
+            info.features = parsed.features;
+            info.max_payload = max_payload;
+            info.protocol_version = protocol_version;
+        }
+        // 状态变化通知server层推送track-devices快照
+        let listener = self.state_listener
+            .lock()
+            .expect("transport state listener poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener();
+        }
+        Ok(())
     }
 
     fn dispatch_open(self: &Arc<Self>, packet: AdbMessage) -> Result<()> {
@@ -3335,6 +3398,7 @@ mod tests {
                 reverse_forwards: Mutex::new(HashMap::new()),
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
+                state_listener: Mutex::new(None),
             }),
         };
 
@@ -3373,6 +3437,7 @@ mod tests {
                 reverse_forwards: Mutex::new(HashMap::new()),
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
+                state_listener: Mutex::new(None),
             }),
         };
 

@@ -2489,6 +2489,12 @@ pub fn run_foreground(config: ServerConfig) -> Result<()> {
         None,
         config.endpoint.listen_all(),
     ));
+    // 设备端授权后重发CNXN等状态变化由transport读循环内联回调，
+    // server借此向track-devices订阅者推送快照（事件驱动，无轮询）
+    transport::set_global_state_listener(Arc::new({
+        let state_listener_state = Arc::clone(&state);
+        move || state_listener_state.notify_device_changed()
+    }));
     let state_mdns = Arc::clone(&state);
     thread::spawn(move || state_mdns.start_mdns());
 
