@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -352,6 +352,10 @@ struct TransportInner {
     closed: AtomicBool,
     /// 设备端状态变化回调（由server层注册，用于触发track-devices推送）
     state_listener: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 运行态AUTH重签名密钥快照（初始握手时加载，运行期不再读盘）
+    auth_keys: Vec<AuthKey>,
+    /// 下一个AUTH签名密钥索引；耗尽后按AOSP NextKey重载语义从头轮换
+    auth_next_key: AtomicUsize,
 }
 
 pub(crate) trait AdbConnection: Send + 'static {
@@ -529,6 +533,9 @@ impl Transport {
     /// 注册设备端状态变化回调：transport读循环在收到对端CNXN等状态帧时触发，
     /// server层借此向track-devices订阅者推送最新快照（对齐AOSP的
     /// update_transport_status回调语义，事件驱动、非轮询）。
+    /// 生产路径由构造时快照的全局listener覆盖（`state_listener_snapshot`），
+    /// 本方法仅供测试在读循环派发前确定性覆盖单个transport的回调。
+    #[cfg(test)]
     pub(crate) fn set_state_listener(&self, listener: Arc<dyn Fn() + Send + Sync>) {
         *self
             .inner
@@ -740,6 +747,8 @@ impl Transport {
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
                 state_listener: Mutex::new(state_listener_snapshot()),
+                auth_keys: Vec::new(),
+                auth_next_key: AtomicUsize::new(0),
             }),
         }
     }
@@ -756,7 +765,11 @@ impl Transport {
         Self::inactive(info, ConnectionState::NoPermissions)
     }
 
-    fn pending(mut info: TransportInfo, connection: Box<dyn AdbConnection>) -> Self {
+    fn pending(
+        mut info: TransportInfo,
+        connection: Box<dyn AdbConnection>,
+        auth_keys: Vec<AuthKey>,
+    ) -> Self {
         info.state = ConnectionState::Offline;
         Self {
             inner: Arc::new(TransportInner {
@@ -768,6 +781,8 @@ impl Transport {
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
                 state_listener: Mutex::new(state_listener_snapshot()),
+                auth_keys,
+                auth_next_key: AtomicUsize::new(0),
             }),
         }
     }
@@ -785,6 +800,8 @@ impl Transport {
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
                 state_listener: Mutex::new(state_listener_snapshot()),
+                auth_keys: Vec::new(),
+                auth_next_key: AtomicUsize::new(0),
             }),
         }
     }
@@ -863,12 +880,76 @@ impl TransportInner {
     fn dispatch_packet(self: &Arc<Self>, packet: AdbMessage) -> Result<()> {
         match packet.command {
             protocol::A_CNXN => self.handle_peer_cnxn(packet),
+            protocol::A_AUTH => self.dispatch_auth(packet),
             protocol::A_OPEN => self.dispatch_open(packet),
             protocol::A_OKAY => self.dispatch_okay(packet),
             protocol::A_WRTE => self.dispatch_write(packet),
             protocol::A_CLSE => self.dispatch_close(packet),
             _ => Ok(()),
         }
+    }
+
+    /// 处理运行态收到的对端AUTH帧。
+    ///
+    /// 标准adbd在授权后只重发CNXN，因此此前读循环丢弃AUTH帧没有影响；
+    /// 但AOSP host的handle_packet对AUTH质询都会重签名应答，「AUTH重认证」
+    /// 类ROM会在unauthorized态用新TOKEN重新发起质询。这里按AOSP语义在
+    /// 认证中态（unauthorized/authorizing）补齐重签名：首个签名按NextKey
+    /// 重载语义从头轮换，恰好对齐握手末尾下发的RSAPUBLICKEY公钥，设备
+    /// 保存公钥后即可验证通过；authorizing态继续应答以支持多轮质询。
+    /// TLS模式按AOSP忽略全部AUTH帧——正常握手完成后transport状态来自
+    /// banner，不会停留在认证中态，因此以该状态族作守卫即可。
+    fn dispatch_auth(&self, packet: AdbMessage) -> Result<()> {
+        if packet.arg0 != protocol::ADB_AUTH_TOKEN {
+            // SIGNATURE/RSAPUBLICKEY是host→adbd方向的应答帧，host运行态不处理
+            return Ok(());
+        }
+        let mut state_changed = false;
+        {
+            let mut info = self.info.lock().expect("transport info poisoned");
+            if !matches!(
+                info.state,
+                ConnectionState::Unauthorized | ConnectionState::Authorizing
+            ) {
+                return Ok(());
+            }
+            if info.state != ConnectionState::Authorizing {
+                // 对齐AOSP handle_packet：签名前先把连接置为kCsAuthorizing
+                info.state = ConnectionState::Authorizing;
+                state_changed = true;
+            }
+        }
+        if state_changed {
+            // 状态变化通知server层推送track-devices快照
+            let listener = self
+                .state_listener
+                .lock()
+                .expect("transport state listener poisoned")
+                .clone();
+            if let Some(listener) = listener {
+                listener();
+            }
+        }
+
+        if self.auth_keys.is_empty() {
+            trace_transport_error(
+                "auth",
+                &AdbError::Server("transport 没有可用 adbkey，无法重签 AUTH TOKEN".to_string()),
+            );
+            return Ok(());
+        }
+        // 对齐AOSP NextKey的reload语义：索引耗尽后从头轮换
+        let index = self.auth_next_key.fetch_add(1, Ordering::SeqCst) % self.auth_keys.len();
+        let Ok(signature) = self.auth_keys[index].sign_token(&packet.payload) else {
+            // 对齐AOSP send_auth_response：签名失败只跳过本次应答，不断开transport
+            return Ok(());
+        };
+        self.write_packet(AdbMessage::new(
+            protocol::A_AUTH,
+            protocol::ADB_AUTH_SIGNATURE,
+            0,
+            signature,
+        )?)
     }
 
     /// 处理运行态收到的对端CNXN。
@@ -893,7 +974,8 @@ impl TransportInner {
             info.protocol_version = protocol_version;
         }
         // 状态变化通知server层推送track-devices快照
-        let listener = self.state_listener
+        let listener = self
+            .state_listener
             .lock()
             .expect("transport state listener poisoned")
             .clone();
@@ -1651,7 +1733,7 @@ impl PendingTransport {
             max_payload: protocol::MAX_PAYLOAD_V1,
             protocol_version: protocol::A_VERSION_MIN,
         };
-        let transport = Transport::pending(info, connection.try_clone_box()?);
+        let transport = Transport::pending(info, connection.try_clone_box()?, auth_keys.clone());
         Ok(Self {
             transport,
             connection,
@@ -2810,6 +2892,189 @@ mod tests {
     }
 
     #[test]
+    fn runtime_unauthorized_token_is_re_signed_and_rotates_keys() {
+        let key0 = AuthKey::from_private_key(
+            RsaPrivateKey::new(&mut OsRng, 1024).unwrap(),
+            Some("runtime-auth user@host".to_string()),
+        );
+        let key1 = AuthKey::from_private_key(RsaPrivateKey::new(&mut OsRng, 1024).unwrap(), None);
+        // PKCS#1 v1.5签名是确定性的：运行态重签名必须逐字节等于对应密钥
+        // 对同一token的直接签名，据此断言轮换顺序。
+        let handshake_signature_0 = key0.sign_token(&[5_u8; 20]).unwrap();
+        let handshake_signature_1 = key1.sign_token(&[6_u8; 20]).unwrap();
+        let handshake_public_key = key0.public_key_payload().unwrap();
+        let runtime_signature_0 = key0.sign_token(&[7_u8; 20]).unwrap();
+        let runtime_signature_1 = key1.sign_token(&[3_u8; 20]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _hello = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+
+            // 握手：两个密钥各签名一次，第三次质询耗尽密钥后下发RSAPUBLICKEY
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![5_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let first = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(first.command, protocol::A_AUTH);
+            assert_eq!(first.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(first.payload, handshake_signature_0);
+
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![6_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let second = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(second.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(second.payload, handshake_signature_1);
+
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![9_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let public_key = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(public_key.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
+            assert_eq!(public_key.payload, handshake_public_key);
+
+            // 运行态重认证：20字节payload的非TOKEN子帧必须被整体忽略
+            // （payload刻意用20字节，若host误把它当TOKEN签名会在这里失配）
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_SIGNATURE,
+                0,
+                vec![1_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+
+            // 第一轮重认证质询：从密钥快照头部的key0重新开始（对齐AOSP
+            // NextKey重载语义，与刚下发的RSAPUBLICKEY公钥对齐）
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![7_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let re_first = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(re_first.command, protocol::A_AUTH);
+            assert_eq!(re_first.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(re_first.payload, runtime_signature_0);
+
+            // 第二轮质询推进到key1，第三轮耗尽后回绕到key0
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![3_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let re_second = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(re_second.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(re_second.payload, runtime_signature_1);
+
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![7_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+            let re_third = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(re_third.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(re_third.payload, runtime_signature_0);
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let pending = prepare_tcp_stream_with_serial_and_auth(
+            26,
+            "runtime-auth".to_string(),
+            stream,
+            vec![key0, key1],
+            false,
+            TCP_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap();
+        // 读循环派发前注册监听器：重签名前先翻转状态并触发track-devices推送
+        let placeholder = pending.transport();
+        let (state_tx, state_rx) = std::sync::mpsc::channel();
+        placeholder.set_state_listener(Arc::new(move || {
+            let _ = state_tx.send(());
+        }));
+        let transport = pending.finish(|_| {}).unwrap();
+
+        assert_eq!(transport.info().state, ConnectionState::Unauthorized);
+        assert_eq!(
+            state_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "unauthorized→authorizing必须触发状态推送"
+        );
+
+        server.join().unwrap();
+        assert_eq!(transport.info().state, ConnectionState::Authorizing);
+    }
+
+    #[test]
+    fn runtime_auth_token_outside_authorizing_states_is_ignored() {
+        let adbd = StubAdbd::spawn(b"device::features=shell_v2;".to_vec(), |stream| {
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![2_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut *stream, protocol::A_VERSION)
+            .unwrap();
+
+            // 已授权transport收到AUTH TOKEN必须保持忽略：不应签名应答，
+            // 也不应把状态回退到authorizing
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let err = AdbMessage::read_from(stream, protocol::MAX_PAYLOAD).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AdbError::Io(ref io_err)
+                        if io_err.kind() == std::io::ErrorKind::WouldBlock
+                            || io_err.kind() == std::io::ErrorKind::TimedOut
+                ),
+                "已授权transport不应应答AUTH TOKEN，实际收到 {err:?}"
+            );
+        });
+
+        let transport = adbd.connect_transport(27);
+        assert_eq!(transport.info().state, ConnectionState::Device);
+        adbd.join();
+        assert_eq!(transport.info().state, ConnectionState::Device);
+    }
+
+    #[test]
     fn pending_transport_reports_authorizing_before_online() {
         let private_key = RsaPrivateKey::new(&mut OsRng, 1024).unwrap();
         let auth_key = AuthKey::from_private_key(private_key, None);
@@ -3399,6 +3664,8 @@ mod tests {
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
                 state_listener: Mutex::new(None),
+                auth_keys: Vec::new(),
+                auth_next_key: AtomicUsize::new(0),
             }),
         };
 
@@ -3438,6 +3705,8 @@ mod tests {
                 next_local_id: AtomicU32::new(1),
                 closed: AtomicBool::new(false),
                 state_listener: Mutex::new(None),
+                auth_keys: Vec::new(),
+                auth_next_key: AtomicUsize::new(0),
             }),
         };
 
