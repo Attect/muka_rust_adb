@@ -891,12 +891,10 @@ impl TransportInner {
 
     /// 处理运行态收到的对端AUTH帧。
     ///
-    /// 标准adbd在授权后只重发CNXN，因此此前读循环丢弃AUTH帧没有影响；
-    /// 但AOSP host的handle_packet对AUTH质询都会重签名应答，「AUTH重认证」
-    /// 类ROM会在unauthorized态用新TOKEN重新发起质询。这里按AOSP语义在
-    /// 认证中态（unauthorized/authorizing）补齐重签名：首个签名按NextKey
-    /// 重载语义从头轮换，恰好对齐握手末尾下发的RSAPUBLICKEY公钥，设备
-    /// 保存公钥后即可验证通过；authorizing态继续应答以支持多轮质询。
+    /// AOSP `atransport::NextKey()` 逐个弹出私钥，队尾是发送用户公钥的哨兵；
+    /// 密钥耗尽后不会在同一transport内回绕，只有重建transport时才ResetKeys。
+    /// 初始握手与运行态共享同一个索引，因此后续TOKEN不能错误地从头重签，
+    /// 也不能在最后一把私钥签名后抢先追加公钥。
     /// TLS模式按AOSP忽略全部AUTH帧——正常握手完成后transport状态来自
     /// banner，不会停留在认证中态，因此以该状态族作守卫即可。
     fn dispatch_auth(&self, packet: AdbMessage) -> Result<()> {
@@ -931,63 +929,43 @@ impl TransportInner {
             }
         }
 
-        if self.auth_keys.is_empty() {
+        let index = self.auth_next_key.fetch_add(1, Ordering::SeqCst);
+        if let Some(auth_key) = self.auth_keys.get(index) {
+            let Ok(signature) = auth_key.sign_token(&packet.payload) else {
+                return Ok(());
+            };
+            self.write_packet(AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_SIGNATURE,
+                0,
+                signature,
+            )?)?;
+            return Ok(());
+        }
+
+        // NextKey已经遇到私钥队尾哨兵：仅发送用户公钥并进入unauthorized，
+        // 绝不能取模回绕后重新签名，也不能继续停留在authorizing。
+        if let Some(public_key) = self.auth_keys.first().and_then(AuthKey::public_key_payload) {
+            self.write_packet(AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_RSAPUBLICKEY,
+                0,
+                public_key,
+            )?)?;
+        } else {
             trace_transport_error(
                 "auth",
-                &AdbError::Server("transport 没有可用 adbkey，无法重签 AUTH TOKEN".to_string()),
+                &AdbError::Server("transport 没有可发送的 adb 用户公钥".to_string()),
             );
-            return Ok(());
         }
-        // 对齐AOSP transport.cpp的AUTH处理帧序：
-        // - 首个TOKEN按NextKey轮换签名应答；每轮签名后推进索引
-        // - 最后一把密钥（穷尽当轮）签名后追加RSAPUBLICKEY帧
-        // - 穷尽回绕后的AUTH TOKEN只重发RSAPUBLICKEY（不签名）：
-        //   adbd把公钥转给framework等待用户确认，不签名避免重复无效质询
-        //   （2026-11-19现网缺陷：缺失该帧导致弹窗无法持久化授权）
-        // - TLS模式按AOSP忽略AUTH帧
-        if self.info.lock().expect("transport info poisoned").state
-            == ConnectionState::Authorizing
-        {
-            // authorizing态维持已推送状态，后续按穷尽/回绕逻辑应答
-        }
-        let index = self.auth_next_key.fetch_add(1, Ordering::SeqCst) % self.auth_keys.len();
-        if index == 0 {
-            if let Some(public_key) = self
-                .auth_keys
-                .first()
-                .and_then(AuthKey::public_key_payload)
-            {
-                self.write_packet(AdbMessage::new(
-                    protocol::A_AUTH,
-                    protocol::ADB_AUTH_RSAPUBLICKEY,
-                    0,
-                    public_key,
-                )?)?;
-            }
-            return Ok(());
-        }
-        let Ok(signature) = self.auth_keys[index].sign_token(&packet.payload) else {
-            return Ok(());
-        };
-        self.write_packet(AdbMessage::new(
-            protocol::A_AUTH,
-            protocol::ADB_AUTH_SIGNATURE,
-            0,
-            signature,
-        )?)?;
-        if index + 1 == self.auth_keys.len() {
-            if let Some(public_key) = self
-                .auth_keys
-                .first()
-                .and_then(AuthKey::public_key_payload)
-            {
-                self.write_packet(AdbMessage::new(
-                    protocol::A_AUTH,
-                    protocol::ADB_AUTH_RSAPUBLICKEY,
-                    0,
-                    public_key,
-                )?)?;
-            }
+        self.info.lock().expect("transport info poisoned").state = ConnectionState::Unauthorized;
+        let listener = self
+            .state_listener
+            .lock()
+            .expect("transport state listener poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener();
         }
         Ok(())
     }
@@ -1231,6 +1209,15 @@ impl TransportInner {
 
     fn close_all_streams(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            if trace_enabled("transport") {
+                let serial = self
+                    .info
+                    .lock()
+                    .expect("transport info poisoned")
+                    .serial
+                    .clone();
+                eprintln!("transport {serial} closed");
+            }
             let _ = self
                 .writer
                 .lock()
@@ -1835,17 +1822,19 @@ where
         "host::features={}",
         supported_features_string_for_burst(burst_mode)
     );
-    AdbMessage::new(
+    let hello = AdbMessage::new(
         protocol::A_CNXN,
         protocol::A_VERSION,
         protocol::MAX_PAYLOAD as u32,
         banner.into_bytes(),
-    )?
-    .write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
+    )?;
+    trace_packet_with_serial("send", Some(&initial_info.serial), &hello);
+    hello.write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
 
     let mut next_key = 0_usize;
     let mut info = loop {
         let message = connection.read_packet(protocol::MAX_PAYLOAD)?;
+        trace_packet_with_serial("recv", Some(&initial_info.serial), &message);
         match message.command {
             protocol::A_CNXN => {
                 let banner = String::from_utf8_lossy(&message.payload);
@@ -1876,20 +1865,27 @@ where
                 }
                 if let Some(auth_key) = auth_keys.get(next_key) {
                     let signature = auth_key.sign_token(&message.payload)?;
-                    AdbMessage::new(protocol::A_AUTH, protocol::ADB_AUTH_SIGNATURE, 0, signature)?
-                        .write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
+                    let response = AdbMessage::new(
+                        protocol::A_AUTH,
+                        protocol::ADB_AUTH_SIGNATURE,
+                        0,
+                        signature,
+                    )?;
+                    trace_packet_with_serial("send", Some(&initial_info.serial), &response);
+                    response.write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
                     next_key += 1;
                     continue;
                 }
 
                 if let Some(public_key) = auth_keys.first().and_then(AuthKey::public_key_payload) {
-                    AdbMessage::new(
+                    let response = AdbMessage::new(
                         protocol::A_AUTH,
                         protocol::ADB_AUTH_RSAPUBLICKEY,
                         0,
                         public_key,
-                    )?
-                    .write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
+                    )?;
+                    trace_packet_with_serial("send", Some(&initial_info.serial), &response);
+                    response.write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
                 }
 
                 break TransportInfo {
@@ -1909,22 +1905,43 @@ where
                 };
             }
             protocol::A_STLS => {
-                AdbMessage::new(protocol::A_STLS, protocol::A_STLS_VERSION, 0, Vec::new())?
-                    .write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
+                let response =
+                    AdbMessage::new(protocol::A_STLS, protocol::A_STLS_VERSION, 0, Vec::new())?;
+                trace_packet_with_serial("send", Some(&initial_info.serial), &response);
+                response.write_to_connection(&mut *connection, protocol::A_VERSION_MIN)?;
                 let auth_key = auth_keys
                     .get(next_key.saturating_sub(1))
                     .or_else(|| auth_keys.first())
                     .ok_or_else(|| AdbError::Protocol("A_STLS 没有可用 adbkey".to_string()))?;
                 connection.start_tls(auth_key)?;
             }
+            protocol::A_OPEN | protocol::A_OKAY | protocol::A_WRTE | protocol::A_CLSE => {
+                // server/transport重建时，USB接收队列里可能仍有上一个transport的
+                // stream帧。AOSP在transport尚未online时忽略这些帧；若在此断开，
+                // 每秒重扫会不断产生新的CNXN/TOKEN，最终还会签中上一轮旧TOKEN。
+                if trace_enabled("transport") {
+                    eprintln!(
+                        "transport {} ignore pre-online {}",
+                        initial_info.serial,
+                        protocol::command_name(message.command)
+                    );
+                }
+            }
             other => {
                 return Err(AdbError::Protocol(format!(
-                    "TCP transport 握手收到意外消息 {}",
+                    "transport 握手收到意外消息 {}",
                     protocol::command_name(other)
                 )));
             }
         }
     };
+
+    // NextKey游标必须跨初始握手和运行态读循环共享；标准未授权路径到这里时
+    // 私钥已耗尽，后续TOKEN只能继续发送用户公钥，不能从key0重新轮换。
+    transport
+        .inner
+        .auth_next_key
+        .store(next_key, Ordering::SeqCst);
 
     if info.max_payload == 0 {
         info.max_payload = protocol::MAX_PAYLOAD_V1;
@@ -2051,15 +2068,27 @@ pub fn normalize_tcp_serial(target: &str) -> Result<String> {
 }
 
 fn trace_packet(direction: &str, packet: &AdbMessage) {
+    trace_packet_with_serial(direction, None, packet);
+}
+
+fn trace_packet_with_serial(direction: &str, serial: Option<&str>, packet: &AdbMessage) {
     if !trace_enabled("packets") {
         return;
     }
     let mut payload = String::new();
     if packet.command == protocol::A_OPEN || packet.command == protocol::A_CNXN {
         payload = format!(" payload={:?}", String::from_utf8_lossy(&packet.payload));
+    } else if packet.command == protocol::A_AUTH {
+        let hex = packet
+            .payload
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        payload = format!(" payload_hex={hex}");
     }
+    let serial = serial.map_or_else(String::new, |serial| format!(" {serial}"));
     eprintln!(
-        "transport {direction} {} arg0={} arg1={} len={}{}",
+        "transport{serial} {direction} {} arg0={} arg1={} len={}{}",
         protocol::command_name(packet.command),
         packet.arg0,
         packet.arg1,
@@ -2932,19 +2961,84 @@ mod tests {
     }
 
     #[test]
-    fn runtime_unauthorized_token_is_re_signed_and_rotates_keys() {
+    fn handshake_ignores_stale_stream_packets_before_auth() {
+        let key = AuthKey::from_private_key(
+            RsaPrivateKey::new(&mut OsRng, 1024).unwrap(),
+            Some("stale-stream user@host".to_string()),
+        );
+        let expected_signature = key.sign_token(&[11_u8; 20]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(hello.command, protocol::A_CNXN);
+
+            // 模拟server重建前排队的旧stream流量。AOSP在online前忽略这些帧，
+            // host必须继续等待本轮AUTH，不能把旧帧当成握手协议错误。
+            for packet in [
+                AdbMessage::new(protocol::A_CLSE, 71, 32, Vec::new()).unwrap(),
+                AdbMessage::new(protocol::A_WRTE, 72, 32, b"old".to_vec()).unwrap(),
+                AdbMessage::new(protocol::A_OKAY, 73, 32, Vec::new()).unwrap(),
+                AdbMessage::new(protocol::A_OPEN, 74, 0, b"shell\0".to_vec()).unwrap(),
+            ] {
+                packet
+                    .write_to(&mut stream, protocol::A_VERSION_MIN)
+                    .unwrap();
+            }
+            AdbMessage::new(
+                protocol::A_AUTH,
+                protocol::ADB_AUTH_TOKEN,
+                0,
+                vec![11_u8; 20],
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION_MIN)
+            .unwrap();
+
+            let response = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(response.command, protocol::A_AUTH);
+            assert_eq!(response.arg0, protocol::ADB_AUTH_SIGNATURE);
+            assert_eq!(response.payload, expected_signature);
+            AdbMessage::new(
+                protocol::A_CNXN,
+                protocol::A_VERSION,
+                protocol::MAX_PAYLOAD as u32,
+                b"device::features=shell_v2;".to_vec(),
+            )
+            .unwrap()
+            .write_to(&mut stream, protocol::A_VERSION)
+            .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let transport = prepare_tcp_stream_with_serial_and_auth(
+            25,
+            "stale-stream".to_string(),
+            stream,
+            vec![key],
+            false,
+            TCP_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap()
+        .finish(|_| {})
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(transport.info().state, ConnectionState::Device);
+    }
+
+    #[test]
+    fn runtime_unauthorized_token_uses_exhausted_key_cursor() {
         let key0 = AuthKey::from_private_key(
             RsaPrivateKey::new(&mut OsRng, 1024).unwrap(),
             Some("runtime-auth user@host".to_string()),
         );
         let key1 = AuthKey::from_private_key(RsaPrivateKey::new(&mut OsRng, 1024).unwrap(), None);
-        // PKCS#1 v1.5签名是确定性的：运行态重签名必须逐字节等于对应密钥
-        // 对同一token的直接签名，据此断言轮换顺序。
+        // PKCS#1 v1.5签名是确定性的：握手签名必须逐字节等于对应密钥
+        // 对同一token的直接签名，据此断言NextKey消耗顺序。
         let handshake_signature_0 = key0.sign_token(&[5_u8; 20]).unwrap();
         let handshake_signature_1 = key1.sign_token(&[6_u8; 20]).unwrap();
         let handshake_public_key = key0.public_key_payload().unwrap();
-        let runtime_signature_0 = key0.sign_token(&[7_u8; 20]).unwrap();
-        let runtime_signature_1 = key1.sign_token(&[3_u8; 20]).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3005,8 +3099,8 @@ mod tests {
             .write_to(&mut stream, protocol::A_VERSION_MIN)
             .unwrap();
 
-            // 运行态AUTH帧序对齐AOSP transport：穷尽回绕后仅重发RSAPUBLICKEY；
-            // 再质询时签名key1并在穷尽当轮追加RSAPUBLICKEY；再次回绕后仅重发公钥
+            // NextKey在握手中已经耗尽：后续TOKEN只重发RSAPUBLICKEY，
+            // 不得取模回绕重签，也不得额外插入第二个公钥帧。
             AdbMessage::new(
                 protocol::A_AUTH,
                 protocol::ADB_AUTH_TOKEN,
@@ -3030,11 +3124,8 @@ mod tests {
             .write_to(&mut stream, protocol::A_VERSION_MIN)
             .unwrap();
             let re_second = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
-            assert_eq!(re_second.arg0, protocol::ADB_AUTH_SIGNATURE);
-            assert_eq!(re_second.payload, runtime_signature_1);
-            let re_second_pub = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
-            assert_eq!(re_second_pub.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
-            assert_eq!(re_second_pub.payload, handshake_public_key);
+            assert_eq!(re_second.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
+            assert_eq!(re_second.payload, handshake_public_key);
 
             AdbMessage::new(
                 protocol::A_AUTH,
@@ -3076,7 +3167,7 @@ mod tests {
         );
 
         server.join().unwrap();
-        assert_eq!(transport.info().state, ConnectionState::Authorizing);
+        assert_eq!(transport.info().state, ConnectionState::Unauthorized);
     }
 
     #[test]

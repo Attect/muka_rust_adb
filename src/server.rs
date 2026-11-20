@@ -786,7 +786,15 @@ impl ServerState {
             match transport::prepare_usb_for_scan(id, &interface, Some(&serial)) {
                 Ok(pending) => match self.complete_pending_transport(pending) {
                     Ok(_) => added += 1,
-                    Err(err) => errors.push(format!("{}: {err}", interface.short_description())),
+                    Err(err) => {
+                        if transport::trace_enabled("transport") {
+                            eprintln!(
+                                "USB handshake {} failed: {err}",
+                                interface.short_description()
+                            );
+                        }
+                        errors.push(format!("{}: {err}", interface.short_description()));
+                    }
                 },
                 Err(err) if err.is_permission_denied() => {
                     if !retrying_no_permissions {
