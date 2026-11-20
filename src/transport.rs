@@ -938,10 +938,35 @@ impl TransportInner {
             );
             return Ok(());
         }
-        // 对齐AOSP NextKey的reload语义：索引耗尽后从头轮换
+        // 对齐AOSP transport.cpp的AUTH处理帧序：
+        // - 首个TOKEN按NextKey轮换签名应答；每轮签名后推进索引
+        // - 最后一把密钥（穷尽当轮）签名后追加RSAPUBLICKEY帧
+        // - 穷尽回绕后的AUTH TOKEN只重发RSAPUBLICKEY（不签名）：
+        //   adbd把公钥转给framework等待用户确认，不签名避免重复无效质询
+        //   （2026-11-19现网缺陷：缺失该帧导致弹窗无法持久化授权）
+        // - TLS模式按AOSP忽略AUTH帧
+        if self.info.lock().expect("transport info poisoned").state
+            == ConnectionState::Authorizing
+        {
+            // authorizing态维持已推送状态，后续按穷尽/回绕逻辑应答
+        }
         let index = self.auth_next_key.fetch_add(1, Ordering::SeqCst) % self.auth_keys.len();
+        if index == 0 {
+            if let Some(public_key) = self
+                .auth_keys
+                .first()
+                .and_then(AuthKey::public_key_payload)
+            {
+                self.write_packet(AdbMessage::new(
+                    protocol::A_AUTH,
+                    protocol::ADB_AUTH_RSAPUBLICKEY,
+                    0,
+                    public_key,
+                )?)?;
+            }
+            return Ok(());
+        }
         let Ok(signature) = self.auth_keys[index].sign_token(&packet.payload) else {
-            // 对齐AOSP send_auth_response：签名失败只跳过本次应答，不断开transport
             return Ok(());
         };
         self.write_packet(AdbMessage::new(
@@ -949,7 +974,22 @@ impl TransportInner {
             protocol::ADB_AUTH_SIGNATURE,
             0,
             signature,
-        )?)
+        )?)?;
+        if index + 1 == self.auth_keys.len() {
+            if let Some(public_key) = self
+                .auth_keys
+                .first()
+                .and_then(AuthKey::public_key_payload)
+            {
+                self.write_packet(AdbMessage::new(
+                    protocol::A_AUTH,
+                    protocol::ADB_AUTH_RSAPUBLICKEY,
+                    0,
+                    public_key,
+                )?)?;
+            }
+        }
+        Ok(())
     }
 
     /// 处理运行态收到的对端CNXN。
@@ -2965,8 +3005,8 @@ mod tests {
             .write_to(&mut stream, protocol::A_VERSION_MIN)
             .unwrap();
 
-            // 第一轮重认证质询：从密钥快照头部的key0重新开始（对齐AOSP
-            // NextKey重载语义，与刚下发的RSAPUBLICKEY公钥对齐）
+            // 运行态AUTH帧序对齐AOSP transport：穷尽回绕后仅重发RSAPUBLICKEY；
+            // 再质询时签名key1并在穷尽当轮追加RSAPUBLICKEY；再次回绕后仅重发公钥
             AdbMessage::new(
                 protocol::A_AUTH,
                 protocol::ADB_AUTH_TOKEN,
@@ -2977,11 +3017,9 @@ mod tests {
             .write_to(&mut stream, protocol::A_VERSION_MIN)
             .unwrap();
             let re_first = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
-            assert_eq!(re_first.command, protocol::A_AUTH);
-            assert_eq!(re_first.arg0, protocol::ADB_AUTH_SIGNATURE);
-            assert_eq!(re_first.payload, runtime_signature_0);
+            assert_eq!(re_first.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
+            assert_eq!(re_first.payload, handshake_public_key);
 
-            // 第二轮质询推进到key1，第三轮耗尽后回绕到key0
             AdbMessage::new(
                 protocol::A_AUTH,
                 protocol::ADB_AUTH_TOKEN,
@@ -2994,6 +3032,9 @@ mod tests {
             let re_second = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
             assert_eq!(re_second.arg0, protocol::ADB_AUTH_SIGNATURE);
             assert_eq!(re_second.payload, runtime_signature_1);
+            let re_second_pub = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
+            assert_eq!(re_second_pub.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
+            assert_eq!(re_second_pub.payload, handshake_public_key);
 
             AdbMessage::new(
                 protocol::A_AUTH,
@@ -3005,8 +3046,8 @@ mod tests {
             .write_to(&mut stream, protocol::A_VERSION_MIN)
             .unwrap();
             let re_third = AdbMessage::read_from(&mut stream, protocol::MAX_PAYLOAD).unwrap();
-            assert_eq!(re_third.arg0, protocol::ADB_AUTH_SIGNATURE);
-            assert_eq!(re_third.payload, runtime_signature_0);
+            assert_eq!(re_third.arg0, protocol::ADB_AUTH_RSAPUBLICKEY);
+            assert_eq!(re_third.payload, handshake_public_key);
         });
 
         let stream = TcpStream::connect(addr).unwrap();
