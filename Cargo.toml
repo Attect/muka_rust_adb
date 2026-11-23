@@ -1,6 +1,6 @@
 [package]
 name = "adb-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Muka Rust ADB：可替代官方实现的 Rust 版 Android Debug Bridge 主机端"
 authors = ["Attect"]
